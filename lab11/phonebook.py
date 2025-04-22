@@ -7,6 +7,7 @@ conn = psycopg2.connect(host="localhost", dbname="lab10", user="postgres",
 
 cur = conn.cursor()
 
+# Create table and procedures
 cur.execute("""CREATE TABLE IF NOT EXISTS phonebook (
       user_id SERIAL PRIMARY KEY,
       name VARCHAR(255) NOT NULL,
@@ -14,6 +15,116 @@ cur.execute("""CREATE TABLE IF NOT EXISTS phonebook (
       phone VARCHAR(255) NOT NULL
 )
 """)
+
+# Create procedures
+cur.execute("""
+CREATE OR REPLACE PROCEDURE insert_or_update_contact(
+    p_name VARCHAR, 
+    p_surname VARCHAR, 
+    p_phone VARCHAR
+)
+AS $$
+BEGIN
+    IF (p_phone LIKE '+%' OR p_phone LIKE '8%') AND LENGTH(p_phone) = 11 THEN
+        IF EXISTS (SELECT 1 FROM phonebook WHERE name = p_name AND surname = p_surname) THEN
+            UPDATE phonebook SET phone = p_phone WHERE name = p_name AND surname = p_surname;
+        ELSE
+            INSERT INTO phonebook (name, surname, phone) VALUES (p_name, p_surname, p_phone);
+        END IF;
+    ELSE
+        RAISE EXCEPTION 'Invalid phone number format. Should start with + or 8 and be 11 digits.';
+    END IF;
+END;
+$$ LANGUAGE plpgsql;
+""")
+
+cur.execute("""
+CREATE OR REPLACE PROCEDURE update_contact(
+    p_column VARCHAR,
+    p_old_value VARCHAR,
+    p_new_value VARCHAR
+)
+AS $$
+BEGIN
+    EXECUTE format('UPDATE phonebook SET %I = $1 WHERE %I = $2', p_column, p_column)
+    USING p_new_value, p_old_value;
+    
+    -- Reset sequence and renumber IDs
+    PERFORM setval(pg_get_serial_sequence('phonebook', 'user_id'), 1, false);
+    
+    UPDATE phonebook
+    SET user_id = new_id
+    FROM (
+        SELECT user_id, ROW_NUMBER() OVER (ORDER BY user_id) as new_id 
+        FROM phonebook
+    ) AS renumbered
+    WHERE phonebook.user_id = renumbered.user_id;
+    
+    PERFORM setval(
+        pg_get_serial_sequence('phonebook', 'user_id'), 
+        COALESCE((SELECT MAX(user_id) FROM phonebook), 0) + 1
+    );
+END;
+$$ LANGUAGE plpgsql;
+""")
+
+cur.execute("""
+CREATE OR REPLACE PROCEDURE delete_contact(
+    p_search_term VARCHAR
+)
+AS $$
+DECLARE
+    v_deleted_count INTEGER;
+BEGIN
+    DELETE FROM phonebook 
+    WHERE phone = p_search_term OR name = p_search_term
+    RETURNING user_id INTO v_deleted_count;
+    
+    IF v_deleted_count > 0 THEN
+        -- Reset sequence and renumber IDs
+        PERFORM setval(pg_get_serial_sequence('phonebook', 'user_id'), 1, false);
+        
+        UPDATE phonebook
+        SET user_id = new_id
+        FROM (
+            SELECT user_id, ROW_NUMBER() OVER (ORDER BY user_id) as new_id 
+            FROM phonebook
+        ) AS renumbered
+        WHERE phonebook.user_id = renumbered.user_id;
+        
+        PERFORM setval(
+            pg_get_serial_sequence('phonebook', 'user_id'), 
+            COALESCE((SELECT MAX(user_id) FROM phonebook), 0) + 1
+        );
+    END IF;
+END;
+$$ LANGUAGE plpgsql;
+""")
+
+cur.execute("""
+CREATE OR REPLACE PROCEDURE renumber_ids()
+AS $$
+BEGIN
+    -- Reset sequence and renumber IDs
+    PERFORM setval(pg_get_serial_sequence('phonebook', 'user_id'), 1, false);
+    
+    UPDATE phonebook
+    SET user_id = new_id
+    FROM (
+        SELECT user_id, ROW_NUMBER() OVER (ORDER BY user_id) as new_id 
+        FROM phonebook
+    ) AS renumbered
+    WHERE phonebook.user_id = renumbered.user_id;
+    
+    PERFORM setval(
+        pg_get_serial_sequence('phonebook', 'user_id'), 
+        COALESCE((SELECT MAX(user_id) FROM phonebook), 0) + 1
+    );
+END;
+$$ LANGUAGE plpgsql;
+""")
+
+conn.commit()
 
 def insert_data():
     print('Type "csv" or "con" to choose option between uploading csv file or typing from console: ')
@@ -23,20 +134,13 @@ def insert_data():
         name = input("Name: ")
         surname = input("Surname: ")
         phone = input("Phone: ")
-        if (phone.startswith('+') or phone.startswith('8')) and len(phone) == 11:
-            cur.execute("SELECT * FROM phonebook WHERE name = %s AND surname = %s", (name, surname))
-            existing = cur.fetchone()
-            if existing:
-                cur.execute("UPDATE phonebook SET phone = %s WHERE name = %s AND surname = %s", 
-                           (phone, name, surname))
-                print(f"Updated phone for {name} {surname}")
-            else:
-                cur.execute("INSERT INTO phonebook (name, surname, phone) VALUES (%s, %s, %s)", 
-                           (name, surname, phone))
-                print(f"Inserted {name} {surname}")
+        try:
+            cur.callproc("insert_or_update_contact", (name, surname, phone))
             conn.commit()
-        else:
-            print("Invalid phone number format. Should start with + or 8 and be 11 digits.")
+            print(f"Successfully processed {name} {surname}")
+        except Exception as e:
+            print(f"Error: {e}")
+            conn.rollback()
 
     elif method == "csv":
         filepath = input("Enter a file path with proper extension: ")
@@ -49,18 +153,10 @@ def insert_data():
                 for row in reader:
                     if len(row) >= 3:
                         name, surname, phone = row[0].strip(), row[1].strip(), row[2].strip()
-                        if (phone.startswith('+') or phone.startswith('8')) and len(phone) == 11:
-                            cur.execute("SELECT * FROM phonebook WHERE name = %s AND surname = %s", 
-                                       (name, surname))
-                            existing = cur.fetchone()
-                            if existing:
-                                cur.execute("UPDATE phonebook SET phone = %s WHERE name = %s AND surname = %s", 
-                                           (phone, name, surname))
-                            else:
-                                cur.execute("INSERT INTO phonebook (name, surname, phone) VALUES (%s, %s, %s)", 
-                                           (name, surname, phone))
+                        try:
+                            cur.callproc("insert_or_update_contact", (name, surname, phone))
                             processed_rows += 1
-                        else:
+                        except:
                             invalid_rows.append(f"Invalid phone format in row: {row}")
                     else:
                         invalid_rows.append(f"Incomplete data in row: {row}")
@@ -79,33 +175,18 @@ def insert_data():
         except Exception as e:
             print(f"Error reading file: {e}")
             conn.rollback()
+
 def update_data():
     column = input('Type the name of the column that you want to change: ')
     value = input(f"Enter {column} that you want to change: ")
     new_value = input(f"Enter the new {column}: ")
-    cur.execute(f"UPDATE phonebook SET {column} = %s WHERE {column} = %s", (new_value, value))
-    # Сброс автоинкремента user_id
-    cur.execute("SELECT pg_get_serial_sequence('phonebook', 'user_id')")
-    seq_name = cur.fetchone()[0]
-    cur.execute(f"ALTER SEQUENCE {seq_name} RESTART WITH 1")
-    
-    # Обновление всех оставшихся user_id
-    cur.execute("""
-        WITH cte AS (SELECT user_id, ROW_NUMBER() OVER (ORDER BY user_id) as new_id FROM phonebook)
-        UPDATE phonebook
-        SET user_id = cte.new_id
-        FROM cte
-        WHERE phonebook.user_id = cte.user_id
-    """)
-    # Получаем максимальное значение user_id
-    cur.execute("SELECT MAX(user_id) FROM phonebook")
-    max_id = cur.fetchone()[0] or 0
-    
-    # Устанавливаем следующий user_id в последовательности
-    cur.execute("SELECT pg_get_serial_sequence('phonebook', 'user_id')")
-    seq_name = cur.fetchone()[0]
-    cur.execute(f"ALTER SEQUENCE {seq_name} RESTART WITH {max_id + 1}")
-    conn.commit()
+    try:
+        cur.callproc("update_contact", (column, value, new_value))
+        conn.commit()
+        print("Update successful")
+    except Exception as e:
+        print(f"Error updating data: {e}")
+        conn.rollback()
 
 def delete_data():
     search_term = input('Write phone number or name to delete: ').strip()
@@ -118,55 +199,23 @@ def delete_data():
         records = cur.fetchall()
         
         if not records:
-            print("No matches found ")
+            print("No matches found")
             return
             
         print("Records found to be deleted:")
-        print(tabulate(records, headers=["ID", "Name", "Surname", "Phone"],tablefmt="fancy_grid"))
+        print(tabulate(records, headers=["ID", "Name", "Surname", "Phone"], tablefmt="fancy_grid"))
         
         confirm = input("Are you sure? (y/n): ").lower()
         if confirm != 'y':
-            print("Undo deletion")
+            print("Deletion cancelled")
             return
 
-        cur.execute("""
-            DELETE FROM phonebook 
-            WHERE phone = %s OR name = %s
-            RETURNING user_id
-        """, (search_term, search_term))
-        deleted_ids = [row[0] for row in cur.fetchall()]
-        
-        if not deleted_ids:
-            print("Nothing has been removed")
-            conn.rollback()
-            return
-            
-        print(f"Records removed: {len(deleted_ids)}")
+        cur.callproc("delete_contact", (search_term,))
         conn.commit()
-
-        if deleted_ids:
-            cur.execute("SELECT COALESCE(MIN(user_id), 0) FROM phonebook")
-            min_id = cur.fetchone()[0]
-            
-            if min_id > 1:
-                cur.execute("""
-                    UPDATE phonebook SET user_id = new_id
-                    FROM (
-                        SELECT user_id, ROW_NUMBER() OVER (ORDER BY user_id) as new_id 
-                        FROM phonebook
-                    ) as renumbered
-                    WHERE phonebook.user_id = renumbered.user_id
-                    AND phonebook.user_id != renumbered.new_id
-                """)
-                conn.commit()
-
-                cur.execute("SELECT MAX(user_id) FROM phonebook")
-                max_id = cur.fetchone()[0] or 0
-                cur.execute(f"ALTER SEQUENCE phonebook_user_id_seq RESTART WITH {max_id + 1}")
-                conn.commit()
-                
+        print(f"Deleted {len(records)} records")
+        
     except Exception as e:
-        print(f"Ошибка при удалении: {e}")
+        print(f"Error deleting data: {e}")
         conn.rollback()
 
 def query_by_pattern():
@@ -176,37 +225,18 @@ def query_by_pattern():
         WHERE name ILIKE %s OR surname ILIKE %s OR phone LIKE %s
     """, (f'%{pattern}%', f'%{pattern}%', f'%{pattern}%'))
     rows = cur.fetchall()
-    print(tabulate(rows, headers=["ID", "Имя", "Фамилия", "Телефон"]))
+    print(tabulate(rows, headers=["ID", "Name", "Surname", "Phone"]))
 
 def display_data():
-    # Сброс автоинкремента user_id
-    cur.execute("SELECT pg_get_serial_sequence('phonebook', 'user_id')")
-    seq_name = cur.fetchone()[0]
-    cur.execute(f"ALTER SEQUENCE {seq_name} RESTART WITH 1")
-    
-    # Обновление всех оставшихся user_id
-    cur.execute("""
-        WITH cte AS (
-            SELECT user_id, ROW_NUMBER() OVER (ORDER BY user_id) as new_id
-            FROM phonebook
-        )
-        UPDATE phonebook
-        SET user_id = cte.new_id
-        FROM cte
-        WHERE phonebook.user_id = cte.user_id
-    """)
-    # Получаем максимальное значение user_id
-    cur.execute("SELECT MAX(user_id) FROM phonebook")
-    max_id = cur.fetchone()[0] or 0
-    
-    # Устанавливаем следующий user_id в последовательности
-    cur.execute("SELECT pg_get_serial_sequence('phonebook', 'user_id')")
-    seq_name = cur.fetchone()[0]
-    cur.execute(f"ALTER SEQUENCE {seq_name} RESTART WITH {max_id + 1}")
-    conn.commit()
-    cur.execute("SELECT * from phonebook;")
-    rows = cur.fetchall()
-    print(tabulate(rows, headers=["ID", "Name", "Surname", "Phone"], tablefmt='fancy_grid'))
+    try:
+        cur.callproc("renumber_ids")
+        conn.commit()
+        cur.execute("SELECT * from phonebook;")
+        rows = cur.fetchall()
+        print(tabulate(rows, headers=["ID", "Name", "Surname", "Phone"], tablefmt='fancy_grid'))
+    except Exception as e:
+        print(f"Error displaying data: {e}")
+        conn.rollback()
 
 while True:
     print("""
