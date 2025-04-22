@@ -3,8 +3,7 @@ import csv
 import pandas as pd
 from tabulate import tabulate 
 
-conn = psycopg2.connect(host="localhost", dbname = "lab10", user = "postgres",
-                        password = "Almaty250505", port = 5433)
+conn = psycopg2.connect(host="localhost", dbname = "lab10", user = "postgres", password = "D@niko123", port = 5432)
 
 cur = conn.cursor()
 
@@ -91,14 +90,43 @@ while check:
 
         #delete
         if command == "d" or command == "D":
-            back = False
-            command = ''
-            phone_var = str(input('Type phone number which you want to delete: '))
-            cur.execute("DELETE FROM phonebook WHERE phone = %s", (phone_var,))
-            conn.commit()
-            back_com = str(input('Type "back" in order to return to the list of the commands: '))
-            if back_com == "back":
-                back = True
+             back = False
+             command = ''
+             phone_var = str(input('Type phone number which you want to delete: '))
+             
+             # Удалить запись
+             cur.execute("DELETE FROM phonebook WHERE phone = %s", (phone_var,))
+             conn.commit()
+             
+             # Сброс автоинкремента user_id
+             cur.execute("SELECT pg_get_serial_sequence('phonebook', 'user_id')")
+             seq_name = cur.fetchone()[0]
+             cur.execute(f"ALTER SEQUENCE {seq_name} RESTART WITH 1")
+             
+             # Обновление всех оставшихся user_id
+             cur.execute("""
+                 WITH cte AS (
+                     SELECT user_id, ROW_NUMBER() OVER (ORDER BY user_id) as new_id
+                     FROM phonebook
+                 )
+                 UPDATE phonebook
+                 SET user_id = cte.new_id
+                 FROM cte
+                 WHERE phonebook.user_id = cte.user_id
+             """)
+             # Получаем максимальное значение user_id
+             cur.execute("SELECT MAX(user_id) FROM phonebook")
+             max_id = cur.fetchone()[0] or 0
+             
+             # Устанавливаем следующий user_id в последовательности
+             cur.execute("SELECT pg_get_serial_sequence('phonebook', 'user_id')")
+             seq_name = cur.fetchone()[0]
+             cur.execute(f"ALTER SEQUENCE {seq_name} RESTART WITH {max_id + 1}")
+             conn.commit()
+         
+             back_com = str(input('Type "back" in order to return to the list of the commands: '))
+             if back_com == "back":
+                 back = True
         
         #update
         if command == 'u' or command == 'U':
